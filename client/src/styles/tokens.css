@@ -1,0 +1,59 @@
+:root {
+  /* Orbital PNF-404 Twilight Palette */
+  --bg-zenith: #06141d;
+  --bg-orbit: #0b2433;
+  --bg-horizon-warm: rgba(247, 168, 76, 0.22);
+  --bg-horizon-glow: rgba(114, 212, 219, 0.14);
+
+  /* KopPad Tactile Sea-Glass Surfaces */
+  --surface-panel: rgba(11, 32, 45, 0.78);
+  --surface-panel-strong: rgba(9, 27, 38, 0.9);
+  --surface-elevated: rgba(18, 49, 66, 0.78);
+  --surface-input: rgba(6, 20, 29, 0.72);
+  --surface-hover: rgba(34, 79, 102, 0.56);
+
+  /* Subtle Glass Borders & Bevels */
+  --border-glass: rgba(164, 228, 236, 0.16);
+  --border-glass-strong: rgba(164, 228, 236, 0.3);
+  --bevel-top: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+
+  /* Typography Colors */
+  --text-primary: #f2fbfc;
+  --text-secondary: #a8cad4;
+  --text-muted: #7097a5;
+
+  /* Koppai HUD Semantic Accents */
+  --koppad-cyan: #53d8e2;
+  --koppad-cyan-deep: #1e8fa0;
+  --sunset-amber: #f7b34d;
+  --sunset-gold: #ffd479;
+  --leaf-lime: #7ce063;
+  --ration-coral: #f87171;
+
+  /* 5 Pikmin Squad Colors */
+  --pikmin-red: #ef5350;
+  --pikmin-yellow: #facc15;
+  --pikmin-blue: #38bdf8;
+  --pikmin-rock: #94a3b8;
+  --pikmin-winged: #f472b6;
+
+  /* Typography */
+  --font-display: 'Fredoka', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-body: 'Nunito', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+  /* Radii */
+  --radius-sm: 10px;
+  --radius-md: 16px;
+  --radius-lg: 24px;
+  --radius-pill: 999px;
+
+  /* Shadows */
+  --shadow-panel: 0 18px 42px rgba(2, 10, 16, 0.44), var(--bevel-top);
+  --shadow-card: 0 8px 22px rgba(3, 12, 19, 0.32), var(--bevel-top);
+  --shadow-btn: 0 4px 12px rgba(2, 10, 16, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+
+  /* Transitions */
+  --ease-spring: cubic-bezier(0.22, 1.25, 0.36, 1);
+  --ease-smooth: cubic-bezier(0.22, 1, 0.36, 1);
+}
