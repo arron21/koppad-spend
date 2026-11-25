@@ -791,7 +791,7 @@ app.get('/api/cron/sunset-sync', async (req, res) => {
 });
 
 // Serve built client in production (non-Vercel self-hosted mode)
-const clientDist = path.resolve(__dirname, '..', 'client', 'dist');
+const clientDist = path.resolve(__dirname, '..', 'dist');
 if (!process.env.VERCEL && process.env.NODE_ENV === 'production' && fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.get('*', (_req, res) => {
