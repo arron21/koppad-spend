@@ -40,14 +40,12 @@ function normalizeDate(raw: string): string | null {
   const trimmed = raw.trim().replace(/^["']|["']$/g, '');
   if (!trimmed) return null;
 
-  // YYYY-MM-DD or YYYY/MM/DD (with optional time)
   const isoMatch = trimmed.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
   if (isoMatch) {
     const [, y, m, d] = isoMatch;
     return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
   }
 
-  // MM/DD/YYYY or M/D/YY
   const usMatch = trimmed.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
   if (usMatch) {
     const [, m, d, yRaw] = usMatch;
@@ -95,7 +93,10 @@ function findHeader(headers: string[], candidates: RegExp[]): string | null {
   return null;
 }
 
-export function detectCsvMapping(headers: string[], records: Record<string, string>[]): CsvColumnMapping {
+export function detectCsvMapping(
+  headers: string[],
+  records: Record<string, string>[]
+): CsvColumnMapping {
   const dateCol =
     findHeader(headers, [
       /^transaction\s*date$/i,
@@ -104,7 +105,9 @@ export function detectCsvMapping(headers: string[], records: Record<string, stri
       /^posting\s*date$/i,
       /^post\s*date$/i,
       /date/i,
-    ]) ?? headers[0] ?? '';
+    ]) ??
+    headers[0] ??
+    '';
 
   const descriptionCol =
     findHeader(headers, [
@@ -115,7 +118,10 @@ export function detectCsvMapping(headers: string[], records: Record<string, stri
       /^memo$/i,
       /^details$/i,
       /desc|merchant|payee|name/i,
-    ]) ?? headers[1] ?? headers[0] ?? '';
+    ]) ??
+    headers[1] ??
+    headers[0] ??
+    '';
 
   const debitCol = findHeader(headers, [/^debit$/i, /^withdrawal/i, /^outflow$/i, /debit/i]);
   const creditCol = findHeader(headers, [/^credit$/i, /^deposit/i, /^inflow$/i, /credit/i]);
@@ -128,7 +134,6 @@ export function detectCsvMapping(headers: string[], records: Record<string, stri
 
   const categoryCol = findHeader(headers, [/^category$/i, /^type$/i, /category/i]);
 
-  // Auto-detect sign convention from sample amounts (ignoring obvious payments/deposits first)
   let signConvention: CsvColumnMapping['signConvention'] = 'positive_is_spend';
   if (amountCol) {
     let negSpend = 0;
@@ -139,7 +144,9 @@ export function detectCsvMapping(headers: string[], records: Record<string, stri
       const val = parseCurrency(rec[amountCol]);
       if (val === null || val === 0) continue;
       const desc = (rec[descriptionCol] ?? '').toLowerCase();
-      const looksLikeCredit = /payment\s*thank\s*you|autopay|payroll|direct\s*dep|refund|credit/i.test(desc);
+      const looksLikeCredit = /payment\s*thank\s*you|autopay|payroll|direct\s*dep|refund|credit/i.test(
+        desc
+      );
       if (looksLikeCredit) {
         if (val > 0) posPayment++;
         else negPayment++;
@@ -203,11 +210,11 @@ function extractAmount(
   return rawVal;
 }
 
-export function previewCsv(
+export async function previewCsv(
   csvText: string,
   accountLabel: string,
   overrideMapping?: Partial<CsvColumnMapping>
-): CsvPreviewResult {
+): Promise<CsvPreviewResult> {
   const { headers, records } = parseRecords(csvText);
   const auto = detectCsvMapping(headers, records);
   const mapping: CsvColumnMapping = {
@@ -219,7 +226,6 @@ export function previewCsv(
         : auto.signConvention,
   };
 
-  const checkDupStmt = db.prepare('SELECT 1 FROM transactions WHERE dedupe_hash = ?');
   const seenInBatch = new Set<string>();
 
   let validRows = 0;
@@ -239,7 +245,8 @@ export function previewCsv(
     validRows++;
     const roundedAmount = Math.round(amount * 100) / 100;
     const hash = makeDedupeHash(sourceKey, date, roundedAmount, rawDescription);
-    const isDuplicate = Boolean(checkDupStmt.get(hash)) || seenInBatch.has(hash);
+    const existingRow = await db.get('SELECT 1 FROM transactions WHERE dedupe_hash = ?', [hash]);
+    const isDuplicate = Boolean(existingRow) || seenInBatch.has(hash);
     seenInBatch.add(hash);
 
     const hintCat = mapping.categoryCol ? rec[mapping.categoryCol] : null;
@@ -282,16 +289,16 @@ export interface CsvImportOptions {
   mapping?: Partial<CsvColumnMapping>;
 }
 
-export function importCsv(
+export async function importCsv(
   csvText: string,
   options: CsvImportOptions
-): {
+): Promise<{
   addedCount: number;
   skippedDuplicates: number;
   excludedCount: number;
   accountId: string;
   affectedDates: string[];
-} {
+}> {
   const { headers, records } = parseRecords(csvText);
   const auto = detectCsvMapping(headers, records);
   const mapping: CsvColumnMapping = {
@@ -306,30 +313,32 @@ export function importCsv(
   const label = options.accountLabel.trim() || 'Uploaded Card CSV';
   const now = new Date().toISOString();
 
-  // Reuse or create CSV account entry
-  let accountRow = db
-    .prepare("SELECT id FROM accounts WHERE name = ? AND source = 'csv'")
-    .get(label) as { id: string } | undefined;
+  const accountRow = await db.get<{ id: string }>(
+    "SELECT id FROM accounts WHERE name = ? AND source = 'csv'",
+    [label]
+  );
 
   let accountId: string;
   if (accountRow) {
     accountId = accountRow.id;
-    db.prepare('UPDATE accounts SET last_synced_at = ? WHERE id = ?').run(now, accountId);
+    await db.run('UPDATE accounts SET last_synced_at = ? WHERE id = ?', [now, accountId]);
   } else {
     accountId = `csv_${crypto.randomUUID().slice(0, 10)}`;
-    db.prepare(
+    await db.run(
       `INSERT INTO accounts (id, name, institution, mask, type, source, last_synced_at, created_at)
-       VALUES (?, ?, ?, ?, ?, 'csv', ?, ?)`
-    ).run(accountId, label, 'CSV Statement', 'CSV', options.cardType, now, now);
+       VALUES (?, ?, ?, ?, ?, 'csv', ?, ?)`,
+      [accountId, label, 'CSV Statement', 'CSV', options.cardType, now, now]
+    );
   }
 
-  const insertTx = db.prepare(`
-    INSERT OR IGNORE INTO transactions (
+  const insertSql = `
+    INSERT INTO transactions (
       id, account_id, account_label, card_type, date, merchant, raw_description,
       amount, category, fruit_alias, source, external_id, dedupe_hash,
       is_excluded, exclude_reason, notes, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'csv', NULL, ?, ?, ?, '', ?)
-  `);
+    ON CONFLICT (dedupe_hash) DO NOTHING
+  `;
 
   const sourceKey = `csv:${label.toLowerCase()}`;
   let addedCount = 0;
@@ -348,7 +357,7 @@ export function importCsv(
     const hintCat = mapping.categoryCol ? rec[mapping.categoryCol] : null;
     const classified = classifyTransaction(rawDescription, roundedAmount, hintCat);
 
-    const res = insertTx.run(
+    const res = await db.run(insertSql, [
       `tx_${crypto.randomUUID().slice(0, 12)}`,
       accountId,
       label,
@@ -362,8 +371,8 @@ export function importCsv(
       hash,
       classified.isExcluded ? 1 : 0,
       classified.excludeReason,
-      now
-    );
+      now,
+    ]);
 
     if (res.changes > 0) {
       addedCount++;
@@ -374,7 +383,7 @@ export function importCsv(
     }
   }
 
-  logSync(
+  await logSync(
     'csv',
     'success',
     addedCount,

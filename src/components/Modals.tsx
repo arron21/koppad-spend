@@ -225,7 +225,7 @@ interface BudgetSettingsModalProps {
   settings: AppSettings;
   onClose: () => void;
   onSave: (patch: Partial<AppSettings>) => Promise<void>;
-  onResetDemo: () => Promise<void>;
+  onResetDemo: (clearOnly?: boolean) => Promise<void>;
 }
 
 export function BudgetSettingsModal({
@@ -356,16 +356,28 @@ export function BudgetSettingsModal({
               flexWrap: 'wrap',
             }}
           >
-            <button
-              type="button"
-              className="k-btn k-btn-danger"
-              onClick={async () => {
-                await onResetDemo();
-                onClose();
-              }}
-            >
-              Reset 10-Day Demo Data
-            </button>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="k-btn k-btn-ghost"
+                onClick={async () => {
+                  await onResetDemo(false);
+                  onClose();
+                }}
+              >
+                Load Demo Data
+              </button>
+              <button
+                type="button"
+                className="k-btn k-btn-danger"
+                onClick={async () => {
+                  await onResetDemo(true);
+                  onClose();
+                }}
+              >
+                Wipe All Data
+              </button>
+            </div>
 
             <div style={{ display: 'flex', gap: 8 }}>
               <button type="button" className="k-btn k-btn-ghost" onClick={onClose}>

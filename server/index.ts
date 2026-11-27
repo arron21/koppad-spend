@@ -6,7 +6,19 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { db, getSettings, initDatabase, updateSettings } from './db.ts';
+import {
+  checkLoginRateLimit,
+  clearFailedLogin,
+  clearSessionCookie,
+  createSessionToken,
+  isAuthEnabled,
+  isRequestAuthenticated,
+  recordFailedLogin,
+  requireAuthMiddleware,
+  setSessionCookie,
+  verifyPassword,
+} from './auth.ts';
+import { db, ensureDatabaseReady, getSettings, updateSettings } from './db.ts';
 import { classifyTransaction, makeDedupeHash, pickFruitAlias } from './categorizer.ts';
 import type { PikminCategory } from './categorizer.ts';
 import { importCsv, previewCsv } from './csvImporter.ts';
@@ -19,16 +31,10 @@ import {
   syncAllAccounts,
 } from './plaidService.ts';
 import { getSchedulerStatus, rescheduleAutoSync } from './scheduler.ts';
-import { seedDemoData } from './seed.ts';
+import { clearAllTransactionsAndAccounts, seedDemoData } from './seed.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-initDatabase();
-seedDemoData(false);
-if (!process.env.VERCEL) {
-  rescheduleAutoSync();
-}
 
 export const app = express();
 const upload = multer({
@@ -36,8 +42,25 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-app.use(cors());
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
+
+// Ensure database schema & initial seed are ready before handling API calls
+app.use('/api', async (_req, res, next) => {
+  try {
+    await ensureDatabaseReady(async () => {
+      await seedDemoData(false);
+      if (!process.env.VERCEL) {
+        await rescheduleAutoSync();
+      }
+    });
+    next();
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Database initialization error',
+    });
+  }
+});
 
 interface TxRow {
   id: string;
@@ -162,52 +185,130 @@ function generateCaptainDebrief(params: {
   };
 }
 
-// Health check
+// ======================================================
+// PUBLIC ROUTES (Health, Auth, Cron)
+// ======================================================
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, today: getTodayIso() });
+  res.json({
+    ok: true,
+    today: getTodayIso(),
+    authEnabled: isAuthEnabled(),
+    dbBackend: db.backend,
+  });
 });
 
+app.get('/api/auth/status', (req, res) => {
+  res.json({
+    authEnabled: isAuthEnabled(),
+    authenticated: isRequestAuthenticated(req),
+    dbBackend: db.backend,
+  });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const ip =
+    (typeof req.headers['x-forwarded-for'] === 'string'
+      ? req.headers['x-forwarded-for'].split(',')[0].trim()
+      : req.socket.remoteAddress) || 'unknown';
+
+  const limit = checkLoginRateLimit(ip);
+  if (!limit.allowed) {
+    res.status(429).json({
+      error: `Too many failed attempts. Try again in ${limit.retryAfterSec}s.`,
+    });
+    return;
+  }
+
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!verifyPassword(password)) {
+    recordFailedLogin(ip);
+    res.status(401).json({ error: 'Invalid KopPad security passcode.' });
+    return;
+  }
+
+  clearFailedLogin(ip);
+  const token = createSessionToken();
+  setSessionCookie(res, token);
+  res.json({ ok: true, authenticated: true });
+});
+
+app.post('/api/auth/logout', (_req, res) => {
+  clearSessionCookie(res);
+  res.json({ ok: true, authenticated: false });
+});
+
+// Vercel Cron endpoint for scheduled Sunset Sync (authenticates via CRON_SECRET)
+app.get('/api/cron/sunset-sync', async (req, res) => {
+  const secret = process.env.CRON_SECRET?.trim();
+  const isVercelCronHeader = req.headers['x-vercel-cron'] === '1';
+  if (secret) {
+    if (req.headers.authorization !== `Bearer ${secret}`) {
+      res.status(401).json({ error: 'Unauthorized cron trigger' });
+      return;
+    }
+  } else if (isAuthEnabled() && !isVercelCronHeader && !isRequestAuthenticated(req)) {
+    res.status(401).json({ error: 'Unauthorized cron trigger' });
+    return;
+  }
+
+  try {
+    const result = await syncAllAccounts({
+      simulateMockPurchase: false,
+      triggerSource: 'vercel_cron',
+    });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Scheduled Sunset Sync failed',
+    });
+  }
+});
+
+// ======================================================
+// PROTECTED KOPPAD API ROUTES
+// ======================================================
+app.use('/api', requireAuthMiddleware);
+
 // List days with spending summaries for a given month (YYYY-MM)
-app.get('/api/days', (req, res) => {
+app.get('/api/days', async (req, res) => {
   const today = getTodayIso();
-  const monthParam = typeof req.query.month === 'string' && /^\d{4}-\d{2}$/.test(req.query.month)
-    ? req.query.month
-    : today.slice(0, 7);
+  const monthParam =
+    typeof req.query.month === 'string' && /^\d{4}-\d{2}$/.test(req.query.month)
+      ? req.query.month
+      : today.slice(0, 7);
 
   const [year, month] = monthParam.split('-').map(Number);
   const daysInMonth = getDaysInMonth(year, month);
   const startDate = `${monthParam}-01`;
   const endDate = `${monthParam}-${String(daysInMonth).padStart(2, '0')}`;
 
-  const rows = db
-    .prepare(
-      `SELECT date,
-              COUNT(*) as purchaseCount,
-              ROUND(SUM(amount), 2) as totalSpent
-       FROM transactions
-       WHERE date >= ? AND date <= ? AND is_excluded = 0
-       GROUP BY date
-       ORDER BY date ASC`
-    )
-    .all(startDate, endDate) as Array<{
+  const rows = await db.all<{
     date: string;
-    purchaseCount: number;
-    totalSpent: number;
-  }>;
+    purchaseCount: number | string;
+    totalSpent: number | string;
+  }>(
+    `SELECT date,
+            COUNT(*) as "purchaseCount",
+            SUM(amount) as "totalSpent"
+     FROM transactions
+     WHERE date >= ? AND date <= ? AND is_excluded = 0
+     GROUP BY date
+     ORDER BY date ASC`,
+    [startDate, endDate]
+  );
 
-  const hiddenRows = db
-    .prepare(
-      `SELECT date, COUNT(*) as hiddenCount
-       FROM transactions
-       WHERE date >= ? AND date <= ? AND is_excluded = 1
-       GROUP BY date`
-    )
-    .all(startDate, endDate) as Array<{ date: string; hiddenCount: number }>;
+  const hiddenRows = await db.all<{ date: string; hiddenCount: number | string }>(
+    `SELECT date, COUNT(*) as "hiddenCount"
+     FROM transactions
+     WHERE date >= ? AND date <= ? AND is_excluded = 1
+     GROUP BY date`,
+    [startDate, endDate]
+  );
 
-  const hiddenMap = new Map(hiddenRows.map((r) => [r.date, r.hiddenCount]));
+  const hiddenMap = new Map(hiddenRows.map((r) => [r.date, Number(r.hiddenCount)]));
   const spentMap = new Map(rows.map((r) => [r.date, r]));
 
-  const settings = getSettings();
+  const settings = await getSettings();
   const dailyTarget = settings.dailyTargetOverride ?? settings.monthlyBudget / daysInMonth;
 
   const days = [];
@@ -240,7 +341,7 @@ app.get('/api/days', (req, res) => {
 });
 
 // Full Pikmin 3 Day-End Report for a specific date
-app.get('/api/day/:date', (req, res) => {
+app.get('/api/day/:date', async (req, res) => {
   const { date } = req.params;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     res.status(400).json({ error: 'Invalid date format. Expected YYYY-MM-DD.' });
@@ -252,11 +353,15 @@ app.get('/api/day/:date', (req, res) => {
   const monthPrefix = date.slice(0, 7);
   const monthStart = `${monthPrefix}-01`;
 
-  const allDayRows = db
-    .prepare(
-      `SELECT * FROM transactions WHERE date = ? ORDER BY created_at ASC, id ASC`
-    )
-    .all(date) as unknown as TxRow[];
+  const rawRows = await db.all<TxRow>(
+    `SELECT * FROM transactions WHERE date = ? ORDER BY created_at ASC, id ASC`,
+    [date]
+  );
+  const allDayRows = rawRows.map((r) => ({
+    ...r,
+    amount: Number(r.amount),
+    is_excluded: Number(r.is_excluded),
+  }));
 
   const purchases = allDayRows.filter((t) => t.is_excluded === 0);
   const excluded = allDayRows.filter((t) => t.is_excluded === 1);
@@ -292,17 +397,15 @@ app.get('/api/day/:date', (req, res) => {
     }
   }
 
-  // Monthly totals up to selected date
-  const monthSumRow = db
-    .prepare(
-      `SELECT COALESCE(SUM(amount), 0) as total
-       FROM transactions
-       WHERE date >= ? AND date <= ? AND is_excluded = 0`
-    )
-    .get(monthStart, date) as { total: number };
-  const monthSpentToDate = Math.round(Number(monthSumRow.total) * 100) / 100;
+  const monthSumRow = await db.get<{ total: number | string }>(
+    `SELECT COALESCE(SUM(amount), 0) as total
+     FROM transactions
+     WHERE date >= ? AND date <= ? AND is_excluded = 0`,
+    [monthStart, date]
+  );
+  const monthSpentToDate = Math.round(Number(monthSumRow?.total ?? 0) * 100) / 100;
 
-  const settings = getSettings();
+  const settings = await getSettings();
   const dailyTarget =
     Math.round((settings.dailyTargetOverride ?? settings.monthlyBudget / daysInMonth) * 100) / 100;
   const monthRemainingDollars = Math.max(
@@ -313,7 +416,6 @@ app.get('/api/day/:date', (req, res) => {
   const rationsDaysRemaining =
     dailyTarget > 0 ? Math.round((monthRemainingDollars / dailyTarget) * 10) / 10 : 0;
 
-  // Compute remaining BEFORE today's spend so the juice bottles can visually drain during tally!
   const spentBeforeToday = Math.max(0, monthSpentToDate - dayTotal);
   const remainingBeforeToday = Math.max(0, settings.monthlyBudget - spentBeforeToday);
   const rationsBeforeToday =
@@ -328,21 +430,19 @@ app.get('/api/day/:date', (req, res) => {
     rationStatus = 'abundant';
   }
 
-  // 14-day rolling Pikmin spending trend ending on `date`
   const trendStart = shiftDate(date, -13);
-  const trendRows = db
-    .prepare(
-      `SELECT date, category, ROUND(SUM(amount), 2) as total
-       FROM transactions
-       WHERE date >= ? AND date <= ? AND is_excluded = 0
-       GROUP BY date, category
-       ORDER BY date ASC`
-    )
-    .all(trendStart, date) as Array<{
+  const trendRows = await db.all<{
     date: string;
     category: PikminCategory;
-    total: number;
-  }>;
+    total: number | string;
+  }>(
+    `SELECT date, category, SUM(amount) as total
+     FROM transactions
+     WHERE date >= ? AND date <= ? AND is_excluded = 0
+     GROUP BY date, category
+     ORDER BY date ASC`,
+    [trendStart, date]
+  );
 
   const trendByDate = new Map<
     string,
@@ -381,9 +481,10 @@ app.get('/api/day/:date', (req, res) => {
     }
   }
 
-  const noteRow = db
-    .prepare('SELECT note, updated_at FROM daily_notes WHERE date = ?')
-    .get(date) as { note: string; updated_at: string } | undefined;
+  const noteRow = await db.get<{ note: string; updated_at: string }>(
+    'SELECT note, updated_at FROM daily_notes WHERE date = ?',
+    [date]
+  );
 
   const debrief = generateCaptainDebrief({
     date,
@@ -397,7 +498,6 @@ app.get('/api/day/:date', (req, res) => {
     persona: settings.captainPersona,
   });
 
-  // Card breakdown for the day
   const creditTotal =
     Math.round(
       purchases.filter((t) => t.card_type === 'credit').reduce((a, b) => a + b.amount, 0) * 100
@@ -441,7 +541,7 @@ app.get('/api/day/:date', (req, res) => {
 });
 
 // Save daily Captain's note
-app.put('/api/day/:date/note', (req, res) => {
+app.put('/api/day/:date/note', async (req, res) => {
   const { date } = req.params;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     res.status(400).json({ error: 'Invalid date' });
@@ -449,15 +549,16 @@ app.put('/api/day/:date/note', (req, res) => {
   }
   const note = typeof req.body?.note === 'string' ? req.body.note.slice(0, 1000) : '';
   const now = new Date().toISOString();
-  db.prepare(
+  await db.run(
     `INSERT INTO daily_notes (date, note, updated_at) VALUES (?, ?, ?)
-     ON CONFLICT(date) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`
-  ).run(date, note, now);
+     ON CONFLICT (date) DO UPDATE SET note = EXCLUDED.note, updated_at = EXCLUDED.updated_at`,
+    [date, note, now]
+  );
   res.json({ date, note, updatedAt: now });
 });
 
 // Manual quick-add purchase
-app.post('/api/transactions', (req, res) => {
+app.post('/api/transactions', async (req, res) => {
   const { date, merchant, amount, category, cardType, accountLabel, notes } = req.body ?? {};
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     res.status(400).json({ error: 'Valid YYYY-MM-DD date is required.' });
@@ -496,37 +597,36 @@ app.post('/api/transactions', (req, res) => {
   const dedupeHash = makeDedupeHash('manual', date, roundedAmount, cleanMerchant, id);
   const fruitAlias = pickFruitAlias(finalCategory, `${cleanMerchant}:${id}`);
 
-  db.prepare(
+  await db.run(
     `INSERT INTO transactions (
       id, account_id, account_label, card_type, date, merchant, raw_description,
       amount, category, fruit_alias, source, external_id, dedupe_hash,
       is_excluded, exclude_reason, notes, created_at
-    ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, ?, 0, NULL, ?, ?)`
-  ).run(
-    id,
-    finalLabel,
-    finalCardType,
-    date,
-    cleanMerchant,
-    cleanMerchant,
-    roundedAmount,
-    finalCategory,
-    fruitAlias,
-    dedupeHash,
-    typeof notes === 'string' ? notes.slice(0, 300) : '',
-    now
+    ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', NULL, ?, 0, NULL, ?, ?)`,
+    [
+      id,
+      finalLabel,
+      finalCardType,
+      date,
+      cleanMerchant,
+      cleanMerchant,
+      roundedAmount,
+      finalCategory,
+      fruitAlias,
+      dedupeHash,
+      typeof notes === 'string' ? notes.slice(0, 300) : '',
+      now,
+    ]
   );
 
-  const created = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+  const created = await db.get('SELECT * FROM transactions WHERE id = ?', [id]);
   res.status(201).json(created);
 });
 
-// Edit a transaction (merchant, amount, category, date, notes, is_excluded)
-app.patch('/api/transactions/:id', (req, res) => {
+// Edit a transaction
+app.patch('/api/transactions/:id', async (req, res) => {
   const { id } = req.params;
-  const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id) as
-    | TxRow
-    | undefined;
+  const existing = await db.get<TxRow>('SELECT * FROM transactions WHERE id = ?', [id]);
   if (!existing) {
     res.status(404).json({ error: 'Transaction not found' });
     return;
@@ -540,7 +640,7 @@ app.patch('/api/transactions/:id', (req, res) => {
   const nextAmount =
     req.body?.amount !== undefined && Number.isFinite(Number(req.body.amount))
       ? Math.round(Number(req.body.amount) * 100) / 100
-      : existing.amount;
+      : Number(existing.amount);
   const nextCategory: PikminCategory = validCategories.includes(req.body?.category)
     ? req.body.category
     : existing.category;
@@ -551,7 +651,11 @@ app.patch('/api/transactions/:id', (req, res) => {
   const nextNotes =
     typeof req.body?.notes === 'string' ? req.body.notes.slice(0, 300) : existing.notes;
   const nextExcluded =
-    req.body?.is_excluded !== undefined ? (req.body.is_excluded ? 1 : 0) : existing.is_excluded;
+    req.body?.is_excluded !== undefined
+      ? req.body.is_excluded
+        ? 1
+        : 0
+      : Number(existing.is_excluded);
   const nextReason =
     req.body?.is_excluded !== undefined
       ? nextExcluded
@@ -563,30 +667,31 @@ app.patch('/api/transactions/:id', (req, res) => {
       ? pickFruitAlias(nextCategory, `${nextMerchant}:${id}`)
       : existing.fruit_alias;
 
-  db.prepare(
+  await db.run(
     `UPDATE transactions
      SET merchant = ?, amount = ?, category = ?, fruit_alias = ?, date = ?,
          notes = ?, is_excluded = ?, exclude_reason = ?
-     WHERE id = ?`
-  ).run(
-    nextMerchant,
-    nextAmount,
-    nextCategory,
-    nextFruitAlias,
-    nextDate,
-    nextNotes,
-    nextExcluded,
-    nextReason,
-    id
+     WHERE id = ?`,
+    [
+      nextMerchant,
+      nextAmount,
+      nextCategory,
+      nextFruitAlias,
+      nextDate,
+      nextNotes,
+      nextExcluded,
+      nextReason,
+      id,
+    ]
   );
 
-  const updated = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+  const updated = await db.get('SELECT * FROM transactions WHERE id = ?', [id]);
   res.json(updated);
 });
 
 // Delete a transaction
-app.delete('/api/transactions/:id', (req, res) => {
-  const result = db.prepare('DELETE FROM transactions WHERE id = ?').run(req.params.id);
+app.delete('/api/transactions/:id', async (req, res) => {
+  const result = await db.run('DELETE FROM transactions WHERE id = ?', [req.params.id]);
   if (result.changes === 0) {
     res.status(404).json({ error: 'Transaction not found' });
     return;
@@ -594,8 +699,8 @@ app.delete('/api/transactions/:id', (req, res) => {
   res.json({ deleted: true });
 });
 
-// CSV Preview (accepts multipart file OR JSON { csvText })
-app.post('/api/csv/preview', upload.single('file'), (req, res) => {
+// CSV Preview
+app.post('/api/csv/preview', upload.single('file'), async (req, res) => {
   try {
     const csvText = req.file
       ? req.file.buffer.toString('utf8')
@@ -615,7 +720,7 @@ app.post('/api/csv/preview', upload.single('file'), (req, res) => {
         ? JSON.parse(req.body.mapping)
         : req.body?.mapping || undefined;
 
-    const preview = previewCsv(csvText, accountLabel, mapping);
+    const preview = await previewCsv(csvText, accountLabel, mapping);
     res.json(preview);
   } catch (err) {
     res.status(400).json({
@@ -624,8 +729,8 @@ app.post('/api/csv/preview', upload.single('file'), (req, res) => {
   }
 });
 
-// CSV Import (accepts multipart file OR JSON { csvText })
-app.post('/api/csv/import', upload.single('file'), (req, res) => {
+// CSV Import
+app.post('/api/csv/import', upload.single('file'), async (req, res) => {
   try {
     const csvText = req.file
       ? req.file.buffer.toString('utf8')
@@ -648,7 +753,7 @@ app.post('/api/csv/import', upload.single('file'), (req, res) => {
         ? JSON.parse(req.body.mapping)
         : req.body?.mapping || undefined;
 
-    const result = importCsv(csvText, { accountLabel, cardType, mapping });
+    const result = await importCsv(csvText, { accountLabel, cardType, mapping });
     res.json(result);
   } catch (err) {
     res.status(400).json({
@@ -658,25 +763,28 @@ app.post('/api/csv/import', upload.single('file'), (req, res) => {
 });
 
 // Accounts management
-app.get('/api/accounts', (_req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT a.*,
-              (SELECT COUNT(*) FROM transactions t WHERE t.account_id = a.id AND t.is_excluded = 0) as tx_count
-       FROM accounts a
-       ORDER BY a.created_at DESC`
-    )
-    .all() as Array<Record<string, unknown>>;
-  res.json(rows.map(sanitizeAccount));
+app.get('/api/accounts', async (_req, res) => {
+  const rows = await db.all<Record<string, unknown>>(
+    `SELECT a.*,
+            (SELECT COUNT(*) FROM transactions t WHERE t.account_id = a.id AND t.is_excluded = 0) as tx_count
+     FROM accounts a
+     ORDER BY a.created_at DESC`
+  );
+  res.json(
+    rows.map((r) => ({
+      ...sanitizeAccount(r),
+      tx_count: Number(r.tx_count ?? 0),
+    }))
+  );
 });
 
-app.delete('/api/accounts/:id', (req, res) => {
+app.delete('/api/accounts/:id', async (req, res) => {
   const { id } = req.params;
   const deleteTxs = req.query.deleteTransactions === 'true';
   if (deleteTxs) {
-    db.prepare('DELETE FROM transactions WHERE account_id = ?').run(id);
+    await db.run('DELETE FROM transactions WHERE account_id = ?', [id]);
   }
-  const result = db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
+  const result = await db.run('DELETE FROM accounts WHERE id = ?', [id]);
   if (result.changes === 0) {
     res.status(404).json({ error: 'Account not found' });
     return;
@@ -685,10 +793,11 @@ app.delete('/api/accounts/:id', (req, res) => {
 });
 
 // Plaid & Local Sandbox Bank Sync endpoints
-app.get('/api/plaid/status', (_req, res) => {
+app.get('/api/plaid/status', async (_req, res) => {
+  const [status, scheduler] = await Promise.all([getPlaidStatus(), getSchedulerStatus()]);
   res.json({
-    ...getPlaidStatus(),
-    scheduler: getSchedulerStatus(),
+    ...status,
+    scheduler,
   });
 });
 
@@ -740,16 +849,18 @@ app.post('/api/plaid/sync', async (req, res) => {
 });
 
 // Settings & Sunset Sync scheduler
-app.get('/api/settings', (_req, res) => {
+app.get('/api/settings', async (_req, res) => {
+  const [settings, scheduler] = await Promise.all([getSettings(), getSchedulerStatus()]);
   res.json({
-    ...getSettings(),
-    scheduler: getSchedulerStatus(),
+    ...settings,
+    scheduler,
   });
 });
 
-app.put('/api/settings', (req, res) => {
-  const updated = updateSettings({
-    monthlyBudget: req.body?.monthlyBudget !== undefined ? Number(req.body.monthlyBudget) : undefined,
+app.put('/api/settings', async (req, res) => {
+  const updated = await updateSettings({
+    monthlyBudget:
+      req.body?.monthlyBudget !== undefined ? Number(req.body.monthlyBudget) : undefined,
     dailyTargetOverride:
       req.body?.dailyTargetOverride === null || req.body?.dailyTargetOverride === ''
         ? null
@@ -760,34 +871,19 @@ app.put('/api/settings', (req, res) => {
     sunsetSyncTime: req.body?.sunsetSyncTime,
     captainPersona: req.body?.captainPersona,
   });
-  const scheduler = rescheduleAutoSync();
+  const scheduler = await rescheduleAutoSync();
   res.json({ ...updated, scheduler });
 });
 
-// Reset demo expedition data
-app.post('/api/demo/reset', (_req, res) => {
-  const result = seedDemoData(true);
-  res.json(result);
-});
-
-// Vercel Cron endpoint for scheduled Sunset Sync
-app.get('/api/cron/sunset-sync', async (req, res) => {
-  const secret = process.env.CRON_SECRET;
-  if (secret && req.headers.authorization !== `Bearer ${secret}`) {
-    res.status(401).json({ error: 'Unauthorized cron trigger' });
+// Reset demo expedition data OR wipe all data cleanly for personal start
+app.post('/api/demo/reset', async (req, res) => {
+  if (req.body?.clearOnly) {
+    await clearAllTransactionsAndAccounts();
+    res.json({ cleared: true, count: 0 });
     return;
   }
-  try {
-    const result = await syncAllAccounts({
-      simulateMockPurchase: false,
-      triggerSource: 'vercel_cron',
-    });
-    res.json({ ok: true, ...result });
-  } catch (err) {
-    res.status(500).json({
-      error: err instanceof Error ? err.message : 'Scheduled Sunset Sync failed',
-    });
-  }
+  const result = await seedDemoData(true);
+  res.json(result);
 });
 
 // Serve built client in production (non-Vercel self-hosted mode)
@@ -801,9 +897,19 @@ if (!process.env.VERCEL && process.env.NODE_ENV === 'production' && fs.existsSyn
 
 if (!process.env.VERCEL) {
   const PORT = Number(process.env.PORT) || 3001;
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`KopPad Spend API listening on http://localhost:${PORT}`);
-  });
+  ensureDatabaseReady(async () => {
+    await seedDemoData(false);
+    await rescheduleAutoSync();
+  })
+    .then(() => {
+      app.listen(PORT, '0.0.0.0', () => {
+        console.log(`KopPad Spend API listening on http://localhost:${PORT} (${db.backend})`);
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to initialize KopPad database:', err);
+      process.exit(1);
+    });
 }
 
 export default app;

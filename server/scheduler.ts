@@ -4,21 +4,31 @@ import { getSettings } from './db.ts';
 import { syncAllAccounts } from './plaidService.ts';
 
 let currentTask: ScheduledTask | null = null;
-let currentScheduleDescription = 'Manual only';
+let currentScheduleDescription = process.env.VERCEL
+  ? 'Vercel Daily Sunset Cron'
+  : 'Manual only';
 let lastRunAt: string | null = null;
 
-export function rescheduleAutoSync(): {
+export async function rescheduleAutoSync(): Promise<{
   mode: string;
   description: string;
   sunsetSyncTime: string;
   lastRunAt: string | null;
-} {
+}> {
   if (currentTask) {
     currentTask.stop();
     currentTask = null;
   }
 
-  const settings = getSettings();
+  const settings = await getSettings();
+
+  if (process.env.VERCEL) {
+    currentScheduleDescription =
+      settings.syncMode === 'manual'
+        ? 'Manual sync only'
+        : `Vercel Sunset Cron + Manual Sync`;
+    return getSchedulerStatus();
+  }
 
   if (settings.syncMode === 'hourly') {
     currentScheduleDescription = 'Every hour on the hour';
@@ -43,8 +53,8 @@ export function rescheduleAutoSync(): {
   return getSchedulerStatus();
 }
 
-export function getSchedulerStatus() {
-  const settings = getSettings();
+export async function getSchedulerStatus() {
+  const settings = await getSettings();
   return {
     mode: settings.syncMode,
     description: currentScheduleDescription,

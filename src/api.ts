@@ -1,6 +1,7 @@
 import type {
   AccountRecord,
   AppSettings,
+  AuthStatusResponse,
   CsvColumnMapping,
   CsvPreviewResponse,
   DayReportResponse,
@@ -10,9 +11,22 @@ import type {
   Transaction,
 } from './types';
 
+export class UnauthorizedError extends Error {
+  constructor(message = 'KopPad locked') {
+    super(message);
+    this.name = 'UnauthorizedError';
+  }
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  const res = await fetch(url, {
+    ...init,
+    credentials: 'include',
+  });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && (data as { locked?: boolean }).locked) {
+    throw new UnauthorizedError((data as { error?: string }).error);
+  }
   if (!res.ok) {
     throw new Error((data as { error?: string }).error || `Request failed (${res.status})`);
   }
@@ -20,7 +34,27 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  getHealth: () => request<{ ok: boolean; today: string }>('/api/health'),
+  getHealth: () =>
+    request<{
+      ok: boolean;
+      today: string;
+      authEnabled: boolean;
+      dbBackend: 'postgres' | 'sqlite' | 'ephemeral_json';
+    }>('/api/health'),
+
+  getAuthStatus: () => request<AuthStatusResponse>('/api/auth/status'),
+
+  login: (password: string) =>
+    request<{ ok: boolean; authenticated: boolean }>('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    }),
+
+  logout: () =>
+    request<{ ok: boolean; authenticated: boolean }>('/api/auth/logout', {
+      method: 'POST',
+    }),
 
   getMonthDays: (month?: string) =>
     request<MonthDaysResponse>(month ? `/api/days?month=${encodeURIComponent(month)}` : '/api/days'),
@@ -151,5 +185,10 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
-  resetDemo: () => request<{ seeded: boolean; count: number }>('/api/demo/reset', { method: 'POST' }),
+  resetDemo: (clearOnly = false) =>
+    request<{ seeded?: boolean; cleared?: boolean; count: number }>('/api/demo/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clearOnly }),
+    }),
 };

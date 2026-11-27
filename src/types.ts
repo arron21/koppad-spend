@@ -129,9 +129,16 @@ export interface PlaidStatusResponse {
   mode: 'plaid_live' | 'local_sandbox';
   plaidEnv: string;
   realConfigured: boolean;
+  dbBackend?: 'postgres' | 'sqlite' | 'ephemeral_json';
   mockPresets: MockBankPreset[];
   recentLogs: SyncLog[];
   scheduler: SchedulerStatus;
+}
+
+export interface AuthStatusResponse {
+  authEnabled: boolean;
+  authenticated: boolean;
+  dbBackend: 'postgres' | 'sqlite' | 'ephemeral_json';
 }
 
 export interface AppSettings {

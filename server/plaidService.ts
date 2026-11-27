@@ -7,6 +7,7 @@ import {
   Products,
 } from 'plaid';
 import { db, logSync } from './db.ts';
+import { decryptSensitiveToken, encryptSensitiveToken } from './auth.ts';
 import { classifyTransaction, makeDedupeHash } from './categorizer.ts';
 
 export interface MockBankPreset {
@@ -115,18 +116,17 @@ function getPlaidClient(): PlaidApi | null {
   return new PlaidApi(config);
 }
 
-export function getPlaidStatus() {
+export async function getPlaidStatus() {
   const realConfigured = isRealPlaidConfigured();
-  const recentLogs = db
-    .prepare(
-      'SELECT id, source, status, added_count, skipped_count, message, created_at FROM sync_logs ORDER BY id DESC LIMIT 12'
-    )
-    .all();
+  const recentLogs = await db.all(
+    'SELECT id, source, status, added_count, skipped_count, message, created_at FROM sync_logs ORDER BY id DESC LIMIT 12'
+  );
 
   return {
     mode: realConfigured ? 'plaid_live' : 'local_sandbox',
     plaidEnv: process.env.PLAID_ENV || 'sandbox',
     realConfigured,
+    dbBackend: db.backend,
     mockPresets: MOCK_BANK_PRESETS,
     recentLogs,
   };
@@ -178,9 +178,10 @@ export async function linkMockAccount(presetId: string): Promise<{
     throw new Error(`Unknown mock card preset: ${presetId}`);
   }
 
-  const existing = db
-    .prepare("SELECT * FROM accounts WHERE source = 'mock_plaid' AND plaid_item_id = ?")
-    .get(`mock_item_${preset.id}`) as Record<string, unknown> | undefined;
+  const existing = await db.get<Record<string, unknown>>(
+    "SELECT * FROM accounts WHERE source = 'mock_plaid' AND plaid_item_id = ?",
+    [`mock_item_${preset.id}`]
+  );
 
   if (existing) {
     return {
@@ -191,26 +192,26 @@ export async function linkMockAccount(presetId: string): Promise<{
 
   const now = new Date().toISOString();
   const accountId = `acc_${crypto.randomUUID().slice(0, 10)}`;
-  db.prepare(
+  await db.run(
     `INSERT INTO accounts (
       id, name, institution, mask, type, source, plaid_item_id, plaid_access_token,
       plaid_account_id, sync_cursor, last_synced_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, 'mock_plaid', ?, ?, ?, 'mock_cursor_1', ?, ?)`
-  ).run(
-    accountId,
-    preset.name,
-    preset.institution,
-    preset.mask,
-    preset.type,
-    `mock_item_${preset.id}`,
-    `mock-access-${preset.id}`,
-    `mock_acct_${preset.id}`,
-    now,
-    now
+    ) VALUES (?, ?, ?, ?, ?, 'mock_plaid', ?, ?, ?, 'mock_cursor_1', ?, ?)`,
+    [
+      accountId,
+      preset.name,
+      preset.institution,
+      preset.mask,
+      preset.type,
+      `mock_item_${preset.id}`,
+      encryptSensitiveToken(`mock-access-${preset.id}`),
+      `mock_acct_${preset.id}`,
+      now,
+      now,
+    ]
   );
 
-  // Pull 4 realistic initial transactions across the last 3 days so linking immediately feels rewarding
-  const addedTransactions = generateMockTransactionsForAccount(
+  const addedTransactions = await generateMockTransactionsForAccount(
     accountId,
     `${preset.name} ••${preset.mask}`,
     preset.type,
@@ -218,7 +219,7 @@ export async function linkMockAccount(presetId: string): Promise<{
     3
   );
 
-  logSync(
+  await logSync(
     'mock_plaid',
     'success',
     addedTransactions,
@@ -226,10 +227,10 @@ export async function linkMockAccount(presetId: string): Promise<{
     `Linked ${preset.institution} ${preset.name} (••${preset.mask}) via Local Sandbox and synced ${addedTransactions} purchases.`
   );
 
-  const created = db.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId) as Record<
-    string,
-    unknown
-  >;
+  const created = (await db.get<Record<string, unknown>>(
+    'SELECT * FROM accounts WHERE id = ?',
+    [accountId]
+  ))!;
   return { account: sanitizeAccount(created), addedTransactions };
 }
 
@@ -242,42 +243,47 @@ export async function exchangeRealPlaidPublicToken(
 }> {
   const client = getPlaidClient();
   if (!client) {
-    throw new Error('Plaid credentials are not configured in .env');
+    throw new Error('Plaid credentials are not configured in environment variables.');
   }
 
   const exchangeRes = await client.itemPublicTokenExchange({ public_token: publicToken });
-  const accessToken = exchangeRes.data.access_token;
+  const encryptedAccessToken = encryptSensitiveToken(exchangeRes.data.access_token);
   const itemId = exchangeRes.data.item_id;
 
-  const accountsRes = await client.accountsGet({ access_token: accessToken });
+  const accountsRes = await client.accountsGet({ access_token: exchangeRes.data.access_token });
   const now = new Date().toISOString();
   const createdAccounts: Record<string, unknown>[] = [];
 
   for (const acct of accountsRes.data.accounts) {
     const isCredit = acct.type === 'credit';
-    const isDebit = acct.type === 'depository' && (acct.subtype === 'checking' || acct.subtype === 'savings');
+    const isDebit =
+      acct.type === 'depository' && (acct.subtype === 'checking' || acct.subtype === 'savings');
     if (!isCredit && !isDebit) continue;
 
     const id = `plaid_${crypto.randomUUID().slice(0, 10)}`;
-    db.prepare(
+    await db.run(
       `INSERT INTO accounts (
         id, name, institution, mask, type, source, plaid_item_id, plaid_access_token,
         plaid_account_id, sync_cursor, last_synced_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, 'plaid', ?, ?, ?, NULL, ?, ?)`
-    ).run(
-      id,
-      acct.name || acct.official_name || 'Connected Card',
-      institutionName || 'Plaid Institution',
-      acct.mask || '',
-      isCredit ? 'credit' : 'debit',
-      itemId,
-      accessToken,
-      acct.account_id,
-      now,
-      now
+      ) VALUES (?, ?, ?, ?, ?, 'plaid', ?, ?, ?, NULL, ?, ?)`,
+      [
+        id,
+        acct.name || acct.official_name || 'Connected Card',
+        institutionName || 'Plaid Institution',
+        acct.mask || '',
+        isCredit ? 'credit' : 'debit',
+        itemId,
+        encryptedAccessToken,
+        acct.account_id,
+        now,
+        now,
+      ]
     );
 
-    const row = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id) as Record<string, unknown>;
+    const row = (await db.get<Record<string, unknown>>(
+      'SELECT * FROM accounts WHERE id = ?',
+      [id]
+    ))!;
     createdAccounts.push(sanitizeAccount(row));
   }
 
@@ -288,20 +294,21 @@ export async function exchangeRealPlaidPublicToken(
   };
 }
 
-function generateMockTransactionsForAccount(
+async function generateMockTransactionsForAccount(
   accountId: string,
   accountLabel: string,
   cardType: 'credit' | 'debit',
   count: number,
   spreadDays: number
-): number {
-  const insertTx = db.prepare(`
-    INSERT OR IGNORE INTO transactions (
+): Promise<number> {
+  const insertSql = `
+    INSERT INTO transactions (
       id, account_id, account_label, card_type, date, merchant, raw_description,
       amount, category, fruit_alias, source, external_id, dedupe_hash,
       is_excluded, exclude_reason, notes, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mock_plaid', ?, ?, ?, ?, '', ?)
-  `);
+    ON CONFLICT (dedupe_hash) DO NOTHING
+  `;
 
   const now = new Date();
   let added = 0;
@@ -317,7 +324,7 @@ function generateMockTransactionsForAccount(
     const hash = makeDedupeHash('mock_plaid', dateStr, amount, pick.raw, extId);
     const classified = classifyTransaction(pick.raw, amount, pick.plaidCat);
 
-    const res = insertTx.run(
+    const res = await db.run(insertSql, [
       `tx_${crypto.randomUUID().slice(0, 12)}`,
       accountId,
       accountLabel,
@@ -332,8 +339,8 @@ function generateMockTransactionsForAccount(
       hash,
       classified.isExcluded ? 1 : 0,
       classified.excludeReason,
-      now.toISOString()
-    );
+      now.toISOString(),
+    ]);
     if (res.changes > 0) added++;
   }
 
@@ -349,9 +356,7 @@ export async function syncAllAccounts(options?: {
   syncedAccounts: number;
   message: string;
 }> {
-  const accounts = db
-    .prepare("SELECT * FROM accounts WHERE source IN ('plaid', 'mock_plaid')")
-    .all() as Array<{
+  const accounts = await db.all<{
     id: string;
     name: string;
     institution: string;
@@ -362,7 +367,7 @@ export async function syncAllAccounts(options?: {
     plaid_access_token: string | null;
     plaid_account_id: string | null;
     sync_cursor: string | null;
-  }>;
+  }>("SELECT * FROM accounts WHERE source IN ('plaid', 'mock_plaid')");
 
   if (accounts.length === 0) {
     return {
@@ -377,7 +382,6 @@ export async function syncAllAccounts(options?: {
   let totalSkipped = 0;
   const now = new Date().toISOString();
 
-  // 1. Real Plaid Items (group by plaid_item_id so cursor sync runs once per Item)
   const plaidClient = getPlaidClient();
   const realAccounts = accounts.filter((a) => a.source === 'plaid' && a.plaid_access_token);
   const byItem = new Map<string, typeof realAccounts>();
@@ -389,13 +393,14 @@ export async function syncAllAccounts(options?: {
   }
 
   if (plaidClient) {
-    const insertTx = db.prepare(`
-      INSERT OR IGNORE INTO transactions (
+    const insertSql = `
+      INSERT INTO transactions (
         id, account_id, account_label, card_type, date, merchant, raw_description,
         amount, category, fruit_alias, source, external_id, dedupe_hash,
         is_excluded, exclude_reason, notes, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'plaid', ?, ?, ?, ?, '', ?)
-    `);
+      ON CONFLICT (dedupe_hash) DO NOTHING
+    `;
 
     for (const [, itemAccounts] of byItem) {
       const primary = itemAccounts[0];
@@ -403,9 +408,12 @@ export async function syncAllAccounts(options?: {
       let hasMore = true;
 
       try {
+        const plainToken = decryptSensitiveToken(primary.plaid_access_token);
+        if (!plainToken) continue;
+
         while (hasMore) {
           const res = await plaidClient.transactionsSync({
-            access_token: primary.plaid_access_token!,
+            access_token: plainToken,
             cursor,
           });
           const data = res.data;
@@ -425,7 +433,7 @@ export async function syncAllAccounts(options?: {
               tx.personal_finance_category?.primary ?? tx.category?.[0] ?? null
             );
 
-            const inserted = insertTx.run(
+            const inserted = await db.run(insertSql, [
               `tx_${crypto.randomUUID().slice(0, 12)}`,
               matchedAcct.id,
               label,
@@ -440,8 +448,8 @@ export async function syncAllAccounts(options?: {
               hash,
               classified.isExcluded ? 1 : 0,
               classified.excludeReason,
-              now
-            );
+              now,
+            ]);
             if (inserted.changes > 0) totalAdded++;
             else totalSkipped++;
           }
@@ -451,28 +459,27 @@ export async function syncAllAccounts(options?: {
         }
 
         for (const a of itemAccounts) {
-          db.prepare('UPDATE accounts SET sync_cursor = ?, last_synced_at = ? WHERE id = ?').run(
+          await db.run('UPDATE accounts SET sync_cursor = ?, last_synced_at = ? WHERE id = ?', [
             cursor ?? null,
             now,
-            a.id
-          );
+            a.id,
+          ]);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Plaid sync failed';
-        logSync('plaid', 'error', 0, 0, `Plaid sync error for ${primary.institution}: ${msg}`);
+        await logSync('plaid', 'error', 0, 0, `Plaid sync error for ${primary.institution}: ${msg}`);
       }
     }
   }
 
-  // 2. Local Sandbox / Mock Plaid accounts
   const mockAccounts = accounts.filter((a) => a.source === 'mock_plaid');
   for (const acct of mockAccounts) {
-    db.prepare('UPDATE accounts SET last_synced_at = ? WHERE id = ?').run(now, acct.id);
+    await db.run('UPDATE accounts SET last_synced_at = ? WHERE id = ?', [now, acct.id]);
   }
   if (mockAccounts.length > 0 && options?.simulateMockPurchase) {
     const chosen = mockAccounts[Math.floor(Math.random() * mockAccounts.length)];
     const label = chosen.mask ? `${chosen.name} ••${chosen.mask}` : chosen.name;
-    const added = generateMockTransactionsForAccount(chosen.id, label, chosen.type, 1, 0);
+    const added = await generateMockTransactionsForAccount(chosen.id, label, chosen.type, 1, 0);
     totalAdded += added;
   }
 
@@ -482,7 +489,7 @@ export async function syncAllAccounts(options?: {
       ? `Synced ${accounts.length} card(s): +${totalAdded} new transaction${totalAdded === 1 ? '' : 's'} discovered.`
       : `Synced ${accounts.length} card(s): all transactions are up to date.`;
 
-  logSync(trigger, 'success', totalAdded, totalSkipped, message);
+  await logSync(trigger, 'success', totalAdded, totalSkipped, message);
 
   return {
     addedCount: totalAdded,
