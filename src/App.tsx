@@ -118,9 +118,14 @@ export default function App() {
       try {
         const [health, auth] = await Promise.all([api.getHealth(), api.getAuthStatus()]);
         if (!mounted) return;
-        const today = health.today || getLocalToday();
-        setSelectedDate(today);
-        setActiveMonth(today.slice(0, 7));
+        const urlParams = new URLSearchParams(window.location.search);
+        const paramDate = urlParams.get('date');
+        const initialDate =
+          paramDate && /^\d{4}-\d{2}-\d{2}$/.test(paramDate)
+            ? paramDate
+            : health.today || getLocalToday();
+        setSelectedDate(initialDate);
+        setActiveMonth(initialDate.slice(0, 7));
         setAuthEnabled(auth.authEnabled);
         setDbBackend(auth.dbBackend);
 
@@ -130,7 +135,7 @@ export default function App() {
           return;
         }
 
-        await Promise.all([loadMonthAndMeta(today.slice(0, 7)), loadDay(today)]);
+        await Promise.all([loadMonthAndMeta(initialDate.slice(0, 7)), loadDay(initialDate)]);
       } catch (err) {
         if (!mounted) return;
         if (err instanceof UnauthorizedError) {
@@ -490,6 +495,7 @@ export default function App() {
           onClose={() => setShowSettingsModal(false)}
           onSave={handleSaveSettings}
           onResetDemo={handleResetDemo}
+          onNotify={notify}
         />
       )}
 

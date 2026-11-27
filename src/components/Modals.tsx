@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { CATEGORY_LIST } from '../types';
 import type { AppSettings, PikminCategory, Transaction } from '../types';
+import { PushNotificationControls } from './PushNotificationControls';
 
 interface TransactionModalProps {
   mode: 'create' | 'edit';
@@ -226,6 +227,7 @@ interface BudgetSettingsModalProps {
   onClose: () => void;
   onSave: (patch: Partial<AppSettings>) => Promise<void>;
   onResetDemo: (clearOnly?: boolean) => Promise<void>;
+  onNotify: (msg: string, isError?: boolean) => void;
 }
 
 export function BudgetSettingsModal({
@@ -233,6 +235,7 @@ export function BudgetSettingsModal({
   onClose,
   onSave,
   onResetDemo,
+  onNotify,
 }: BudgetSettingsModalProps) {
   const [monthlyBudget, setMonthlyBudget] = useState(String(settings.monthlyBudget));
   const [dailyOverride, setDailyOverride] = useState(
@@ -343,6 +346,8 @@ export function BudgetSettingsModal({
               <option value="charlie">Always Captain Charlie (Commander)</option>
             </select>
           </div>
+
+          <PushNotificationControls onNotify={onNotify} />
 
           <div
             style={{

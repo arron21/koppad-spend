@@ -32,6 +32,12 @@ import {
   syncAllAccounts,
 } from './plaidService.ts';
 import { getSchedulerStatus, rescheduleAutoSync } from './scheduler.ts';
+import {
+  getPushStatus,
+  removePushSubscription,
+  savePushSubscription,
+  sendSunsetSpendingNotification,
+} from './pushService.ts';
 import { clearAllTransactionsAndAccounts, seedDemoData } from './seed.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -280,7 +286,11 @@ app.get('/api/cron/sunset-sync', async (req, res) => {
       simulateMockPurchase: false,
       triggerSource: 'vercel_cron',
     });
-    res.json({ ok: true, ...result });
+    const pushResult = await sendSunsetSpendingNotification({ isTest: false }).catch((err) => ({
+      sentCount: 0,
+      error: err instanceof Error ? err.message : 'Push dispatch skipped',
+    }));
+    res.json({ ok: true, ...result, push: pushResult });
   } catch (err) {
     res.status(500).json({
       error: err instanceof Error ? err.message : 'Scheduled Sunset Sync failed',
@@ -899,6 +909,56 @@ app.put('/api/settings', async (req, res) => {
   });
   const scheduler = await rescheduleAutoSync();
   res.json({ ...updated, scheduler });
+});
+
+// Web Push Daily Sunset Notifications
+app.get('/api/push/status', async (_req, res) => {
+  try {
+    const status = await getPushStatus();
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Unable to read push status',
+    });
+  }
+});
+
+app.post('/api/push/subscribe', async (req, res) => {
+  try {
+    const { subscription, timezone } = req.body ?? {};
+    const result = await savePushSubscription(
+      subscription,
+      timezone,
+      req.headers['user-agent']
+    );
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : 'Unable to save push subscription',
+    });
+  }
+});
+
+app.post('/api/push/unsubscribe', async (req, res) => {
+  try {
+    await removePushSubscription(String(req.body?.endpoint || ''));
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : 'Unable to unsubscribe device',
+    });
+  }
+});
+
+app.post('/api/push/test', async (_req, res) => {
+  try {
+    const result = await sendSunsetSpendingNotification({ isTest: true });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'Unable to send test notification',
+    });
+  }
 });
 
 // Reset demo expedition data OR wipe all data cleanly for personal start

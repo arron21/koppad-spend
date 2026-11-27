@@ -191,4 +191,26 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clearOnly }),
     }),
+
+  getPushStatus: () =>
+    request<{ publicKey: string; subscriptionCount: number }>('/api/push/status'),
+
+  subscribePush: (subscription: PushSubscriptionJSON, timezone: string) =>
+    request<{ ok: boolean; subscriptionCount: number }>('/api/push/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscription, timezone }),
+    }),
+
+  unsubscribePush: (endpoint: string) =>
+    request<{ ok: boolean }>('/api/push/unsubscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint }),
+    }),
+
+  sendTestPush: () =>
+    request<{ ok: boolean; sentCount: number; title: string; body: string }>('/api/push/test', {
+      method: 'POST',
+    }),
 };

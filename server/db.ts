@@ -119,6 +119,15 @@ class PostgresDriver implements AsyncDbDriver {
         message TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        endpoint TEXT PRIMARY KEY,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        timezone TEXT NOT NULL DEFAULT 'America/Los_Angeles',
+        user_agent TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
     `);
   }
 
@@ -224,6 +233,15 @@ class LocalSqliteDriver implements AsyncDbDriver {
         message TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        endpoint TEXT PRIMARY KEY,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        timezone TEXT NOT NULL DEFAULT 'America/Los_Angeles',
+        user_agent TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
     `);
   }
 
@@ -253,6 +271,7 @@ interface JsonStore {
   daily_notes: Array<Record<string, unknown>>;
   settings: Array<{ key: string; value: string }>;
   sync_logs: Array<Record<string, unknown>>;
+  push_subscriptions?: Array<Record<string, unknown>>;
   nextLogId: number;
 }
 
@@ -269,7 +288,9 @@ class EphemeralJsonDriver implements AsyncDbDriver {
   private load(): JsonStore {
     try {
       if (fs.existsSync(this.filePath)) {
-        return JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as JsonStore;
+        const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as JsonStore;
+        parsed.push_subscriptions = parsed.push_subscriptions || [];
+        return parsed;
       }
     } catch {
       // Ignore corrupted /tmp file
@@ -280,6 +301,7 @@ class EphemeralJsonDriver implements AsyncDbDriver {
       daily_notes: [],
       settings: [],
       sync_logs: [],
+      push_subscriptions: [],
       nextLogId: 1,
     };
   }
@@ -626,6 +648,29 @@ class EphemeralJsonDriver implements AsyncDbDriver {
       return { changes: 1 };
     }
 
+    if (/INTO push_subscriptions/i.test(q)) {
+      const [endpoint, p256dh, auth, timezone, user_agent, created_at] = params;
+      const list = this.store.push_subscriptions || (this.store.push_subscriptions = []);
+      const existing = list.find((s) => s.endpoint === endpoint);
+      if (existing) {
+        Object.assign(existing, { p256dh, auth, timezone, user_agent, created_at });
+      } else {
+        list.push({ endpoint, p256dh, auth, timezone, user_agent, created_at });
+      }
+      this.save();
+      return { changes: 1 };
+    }
+
+    if (/^DELETE FROM push_subscriptions WHERE endpoint = \?/i.test(q)) {
+      const [endpoint] = params;
+      const list = this.store.push_subscriptions || [];
+      const before = list.length;
+      this.store.push_subscriptions = list.filter((s) => s.endpoint !== endpoint);
+      const changes = before - this.store.push_subscriptions.length;
+      if (changes > 0) this.save();
+      return { changes };
+    }
+
     return { changes: 0 };
   }
 
@@ -639,6 +684,9 @@ class EphemeralJsonDriver implements AsyncDbDriver {
     }
     if (/^SELECT COUNT\(\*\) as c FROM accounts/i.test(q)) {
       return { c: this.store.accounts.length } as unknown as T;
+    }
+    if (/^SELECT COUNT\(\*\) as c FROM push_subscriptions/i.test(q)) {
+      return { c: (this.store.push_subscriptions || []).length } as unknown as T;
     }
     if (/^SELECT 1 FROM transactions WHERE dedupe_hash = \?/i.test(q)) {
       const [hash] = params;
@@ -684,6 +732,9 @@ class EphemeralJsonDriver implements AsyncDbDriver {
     params: unknown[] = []
   ): Promise<T[]> {
     const q = sql.replace(/\s+/g, ' ').trim();
+    if (/^SELECT \* FROM push_subscriptions/i.test(q)) {
+      return [...(this.store.push_subscriptions || [])] as unknown as T[];
+    }
     if (/^SELECT key, value FROM settings/i.test(q)) {
       return [...this.store.settings] as unknown as T[];
     }

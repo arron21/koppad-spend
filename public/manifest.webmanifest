@@ -1,0 +1,32 @@
+{
+  "name": "KopPad Ledger — Pikmin 3 Day-End Spending Report",
+  "short_name": "KopPad Ledger",
+  "description": "Review every credit and debit card purchase at sunset with Pikmin 3 Day-End reports, Budget Juice bottles, and daily spending push alerts.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#06141d",
+  "theme_color": "#06141d",
+  "categories": ["finance", "productivity"],
+  "icons": [
+    {
+      "src": "/pwa-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

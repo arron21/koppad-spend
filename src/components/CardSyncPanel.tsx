@@ -9,6 +9,7 @@ import type {
   CsvPreviewResponse,
   PlaidStatusResponse,
 } from '../types';
+import { PushNotificationControls } from './PushNotificationControls';
 
 declare global {
   interface Window {
@@ -466,7 +467,7 @@ export function CardSyncPanel({
               </div>
             </div>
 
-            <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
+            <div style={{ marginTop: 12, marginBottom: 14, display: 'flex', justifyContent: 'flex-end' }}>
               <button
                 type="button"
                 className="k-btn k-btn-primary"
@@ -476,6 +477,8 @@ export function CardSyncPanel({
                 {savingSchedule ? 'Updating...' : 'Save Sync Schedule'}
               </button>
             </div>
+
+            <PushNotificationControls onNotify={onNotify} />
           </section>
         </div>
 

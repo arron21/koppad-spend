@@ -2,10 +2,11 @@ import cron from 'node-cron';
 import type { ScheduledTask } from 'node-cron';
 import { getSettings } from './db.ts';
 import { syncAllAccounts } from './plaidService.ts';
+import { sendSunsetSpendingNotification } from './pushService.ts';
 
 let currentTask: ScheduledTask | null = null;
 let currentScheduleDescription = process.env.VERCEL
-  ? 'Vercel Daily Sunset Cron'
+  ? 'Vercel Daily Sunset Sync & Push'
   : 'Manual only';
 let lastRunAt: string | null = null;
 
@@ -26,7 +27,7 @@ export async function rescheduleAutoSync(): Promise<{
     currentScheduleDescription =
       settings.syncMode === 'manual'
         ? 'Manual sync only'
-        : `Vercel Sunset Cron + Manual Sync`;
+        : `Daily Sunset Sync & Push Alert`;
     return getSchedulerStatus();
   }
 
@@ -41,10 +42,11 @@ export async function rescheduleAutoSync(): Promise<{
     const safeHour = Number.isFinite(hh) && hh >= 0 && hh <= 23 ? hh : 21;
     const safeMin = Number.isFinite(mm) && mm >= 0 && mm <= 59 ? mm : 0;
     const expr = `${safeMin} ${safeHour} * * *`;
-    currentScheduleDescription = `Daily Sunset Sync at ${String(safeHour).padStart(2, '0')}:${String(safeMin).padStart(2, '0')}`;
+    currentScheduleDescription = `Daily Sunset Sync & Push at ${String(safeHour).padStart(2, '0')}:${String(safeMin).padStart(2, '0')}`;
     currentTask = cron.schedule(expr, async () => {
       lastRunAt = new Date().toISOString();
       await syncAllAccounts({ simulateMockPurchase: false, triggerSource: 'scheduler' });
+      await sendSunsetSpendingNotification({ isTest: false }).catch(() => {});
     });
   } else {
     currentScheduleDescription = 'Manual sync only';
