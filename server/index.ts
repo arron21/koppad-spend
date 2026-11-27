@@ -186,7 +186,7 @@ function generateCaptainDebrief(params: {
 }
 
 // ======================================================
-// PUBLIC ROUTES (Health, Auth, Cron)
+// PUBLIC ROUTES (Health, Auth, Cron, Plaid Webhook)
 // ======================================================
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -194,7 +194,28 @@ app.get('/api/health', (_req, res) => {
     today: getTodayIso(),
     authEnabled: isAuthEnabled(),
     dbBackend: db.backend,
+    plaidEnv: (process.env.PLAID_ENV || 'sandbox').toLowerCase(),
+    plaidConfigured: Boolean(
+      process.env.PLAID_CLIENT_ID?.trim() && process.env.PLAID_SECRET?.trim()
+    ),
   });
+});
+
+app.post('/api/plaid/webhook', async (req, res) => {
+  const code = req.body?.webhook_code;
+  if (
+    code === 'SYNC_UPDATES_AVAILABLE' ||
+    code === 'DEFAULT_UPDATE' ||
+    code === 'INITIAL_UPDATE' ||
+    code === 'HISTORICAL_UPDATE'
+  ) {
+    try {
+      await syncAllAccounts({ simulateMockPurchase: false, triggerSource: 'plaid_webhook' });
+    } catch {
+      // Acknowledge webhook cleanly even if transient sync error occurs
+    }
+  }
+  res.json({ received: true });
 });
 
 app.get('/api/auth/status', (req, res) => {
@@ -801,9 +822,11 @@ app.get('/api/plaid/status', async (_req, res) => {
   });
 });
 
-app.post('/api/plaid/link-token', async (_req, res) => {
+app.post('/api/plaid/link-token', async (req, res) => {
   try {
-    const result = await createPlaidLinkToken();
+    const origin =
+      typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+    const result = await createPlaidLinkToken(origin);
     res.json(result);
   } catch (err) {
     res.status(500).json({

@@ -132,29 +132,40 @@ export async function getPlaidStatus() {
   };
 }
 
-export async function createPlaidLinkToken(): Promise<{
+export async function createPlaidLinkToken(originUrl?: string): Promise<{
   linkToken: string;
   mode: 'plaid_live' | 'local_sandbox';
+  plaidEnv: string;
 }> {
+  const plaidEnv = (process.env.PLAID_ENV || 'sandbox').toLowerCase();
   const client = getPlaidClient();
   if (!client) {
     return {
       linkToken: `mock-link-sandbox-${crypto.randomUUID()}`,
       mode: 'local_sandbox',
+      plaidEnv,
     };
   }
 
+  const webhookUrl =
+    process.env.PLAID_WEBHOOK_URL?.trim() ||
+    (originUrl && originUrl.startsWith('https://') ? `${originUrl}/api/plaid/webhook` : undefined);
+  const redirectUri = process.env.PLAID_REDIRECT_URI?.trim() || undefined;
+
   const response = await client.linkTokenCreate({
     user: { client_user_id: 'koppad-captain-local' },
-    client_name: 'KopPad Spend',
+    client_name: 'KopPad Ledger',
     products: [Products.Transactions],
     country_codes: [CountryCode.Us],
     language: 'en',
+    ...(webhookUrl ? { webhook: webhookUrl } : {}),
+    ...(redirectUri ? { redirect_uri: redirectUri } : {}),
   });
 
   return {
     linkToken: response.data.link_token,
     mode: 'plaid_live',
+    plaidEnv,
   };
 }
 

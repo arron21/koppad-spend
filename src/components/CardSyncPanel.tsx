@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { soundEngine } from '../audio/soundEngine';
 import { PIKMIN_CATEGORIES, formatMoney } from '../types';
@@ -15,8 +15,9 @@ declare global {
     Plaid?: {
       create: (config: {
         token: string;
+        receivedRedirectUri?: string;
         onSuccess: (publicToken: string, metadata: { institution?: { name?: string } }) => void;
-        onExit?: (err: unknown) => void;
+        onExit?: (err: { error_message?: string; display_message?: string } | null) => void;
       }) => { open: () => void };
     };
   }
@@ -80,30 +81,62 @@ export function CardSyncPanel({
   const [sunsetTime, setSunsetTime] = useState(settings?.sunsetSyncTime ?? '21:00');
   const [savingSchedule, setSavingSchedule] = useState(false);
 
+  const launchPlaidHandler = (linkToken: string, receivedRedirectUri?: string) => {
+    if (!window.Plaid) {
+      onNotify('Plaid Link script is still loading — please try again in a moment.', true);
+      return;
+    }
+    const handler = window.Plaid.create({
+      token: linkToken,
+      ...(receivedRedirectUri ? { receivedRedirectUri } : {}),
+      onSuccess: async (publicToken, metadata) => {
+        window.sessionStorage.removeItem('koppad_plaid_link_token');
+        try {
+          const res = await api.exchangePlaidPublicToken(
+            publicToken,
+            metadata?.institution?.name
+          );
+          soundEngine.playSyncPulse();
+          onNotify(
+            `Linked ${res.accounts.length} Plaid card(s) and imported ${res.addedTransactions} transactions!`
+          );
+          await onRefreshAll();
+        } catch (err) {
+          onNotify(err instanceof Error ? err.message : 'Plaid exchange failed', true);
+        }
+      },
+      onExit: (err) => {
+        if (err && (err.display_message || err.error_message)) {
+          onNotify(err.display_message || err.error_message || 'Plaid Link exited', true);
+        }
+      },
+    });
+    handler.open();
+  };
+
+  useEffect(() => {
+    if (!window.location.search.includes('oauth_state_id=')) return;
+    const savedToken = window.sessionStorage.getItem('koppad_plaid_link_token');
+    if (!savedToken) return;
+    const tryResume = () => {
+      if (window.Plaid) {
+        launchPlaidHandler(savedToken, window.location.href);
+        window.history.replaceState({}, document.title, window.location.pathname);
+      } else {
+        window.setTimeout(tryResume, 250);
+      }
+    };
+    tryResume();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleOpenPlaidLink = async () => {
     soundEngine.playTap();
     try {
       const { linkToken, mode } = await api.createPlaidLinkToken();
-      if (mode === 'plaid_live' && window.Plaid) {
-        const handler = window.Plaid.create({
-          token: linkToken,
-          onSuccess: async (publicToken, metadata) => {
-            try {
-              const res = await api.exchangePlaidPublicToken(
-                publicToken,
-                metadata?.institution?.name
-              );
-              soundEngine.playSyncPulse();
-              onNotify(
-                `Linked ${res.accounts.length} Plaid card(s) and imported ${res.addedTransactions} transactions!`
-              );
-              await onRefreshAll();
-            } catch (err) {
-              onNotify(err instanceof Error ? err.message : 'Plaid exchange failed', true);
-            }
-          },
-        });
-        handler.open();
+      if (mode === 'plaid_live') {
+        window.sessionStorage.setItem('koppad_plaid_link_token', linkToken);
+        launchPlaidHandler(linkToken);
       } else {
         setShowSandboxPicker(true);
       }
@@ -245,9 +278,36 @@ export function CardSyncPanel({
                 </div>
               </div>
               <span className={`status-badge ${plaidStatus?.realConfigured ? 'abundant' : 'healthy'}`}>
-                {plaidStatus?.realConfigured ? 'Plaid Connected' : 'Local Sandbox Ready'}
+                {plaidStatus?.realConfigured
+                  ? `Plaid ${plaidStatus.plaidEnv}`
+                  : 'Local Sandbox Ready'}
               </span>
             </div>
+
+            {plaidStatus?.realConfigured &&
+              plaidStatus.plaidEnv.toLowerCase() === 'sandbox' && (
+                <div
+                  style={{
+                    marginBottom: 14,
+                    padding: '10px 14px',
+                    borderRadius: 12,
+                    background: 'rgba(247, 179, 77, 0.14)',
+                    border: '1px solid rgba(247, 179, 77, 0.36)',
+                    fontSize: '0.8rem',
+                    lineHeight: 1.5,
+                    color: 'var(--text-primary)',
+                  }}
+                >
+                  <strong style={{ color: 'var(--sunset-gold)' }}>
+                    Plaid is currently in Sandbox mode:
+                  </strong>{' '}
+                  Plaid Sandbox never sends real SMS codes to your phone! In Sandbox, click{' '}
+                  <strong>Continue as Guest</strong> (or enter test code <code>123456</code>, username{' '}
+                  <code>user_good</code>, password <code>pass_good</code>). To connect your real bank
+                  & receive real SMS codes, set <code>PLAID_ENV=production</code> and use your
+                  Production secret in Vercel.
+                </div>
+              )}
 
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
               <button

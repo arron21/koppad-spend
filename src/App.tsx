@@ -110,6 +110,9 @@ export default function App() {
 
   // Initial bootstrap with auth check
   useEffect(() => {
+    if (window.location.search.includes('oauth_state_id=')) {
+      setActiveTab('sync');
+    }
     let mounted = true;
     (async () => {
       try {
