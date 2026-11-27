@@ -26,6 +26,16 @@ export function getPostgresUrl(): string | null {
   for (const c of candidates) {
     if (c && c.trim()) return c.trim();
   }
+  // Also support custom-prefixed Vercel Storage integrations (e.g. KOPPAD_DATABASE_URL / KOPPAD_POSTGRES_URL)
+  for (const [key, val] of Object.entries(process.env)) {
+    if (
+      val &&
+      val.trim().startsWith('postgres') &&
+      (/(DATABASE_URL|POSTGRES_URL)$/i.test(key))
+    ) {
+      return val.trim();
+    }
+  }
   return null;
 }
 

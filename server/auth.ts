@@ -8,7 +8,12 @@ const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const failedAttempts = new Map<string, { count: number; resetAt: number }>();
 
 function getConfiguredPassword(): string {
-  return (process.env.APP_PASSWORD || '').trim();
+  return (
+    process.env.APP_PASSWORD ||
+    process.env.KOPPAD_PASSWORD ||
+    process.env.PASSWORD ||
+    ''
+  ).trim();
 }
 
 export function isAuthEnabled(): boolean {
