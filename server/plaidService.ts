@@ -96,7 +96,7 @@ export function isRealPlaidConfigured(): boolean {
 
 function getPlaidClient(): PlaidApi | null {
   if (!isRealPlaidConfigured()) return null;
-  const envName = (process.env.PLAID_ENV || 'sandbox').toLowerCase();
+  const envName = (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase();
   const basePath =
     envName === 'production'
       ? PlaidEnvironments.production
@@ -124,7 +124,7 @@ export async function getPlaidStatus() {
 
   return {
     mode: realConfigured ? 'plaid_live' : 'local_sandbox',
-    plaidEnv: process.env.PLAID_ENV || 'sandbox',
+    plaidEnv: (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase(),
     realConfigured,
     dbBackend: db.backend,
     mockPresets: MOCK_BANK_PRESETS,
@@ -137,7 +137,7 @@ export async function createPlaidLinkToken(originUrl?: string): Promise<{
   mode: 'plaid_live' | 'local_sandbox';
   plaidEnv: string;
 }> {
-  const plaidEnv = (process.env.PLAID_ENV || 'sandbox').toLowerCase();
+  const plaidEnv = (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase();
   const client = getPlaidClient();
   if (!client) {
     return {

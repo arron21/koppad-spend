@@ -194,7 +194,7 @@ app.get('/api/health', (_req, res) => {
     today: getTodayIso(),
     authEnabled: isAuthEnabled(),
     dbBackend: db.backend,
-    plaidEnv: (process.env.PLAID_ENV || 'sandbox').toLowerCase(),
+    plaidEnv: (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase(),
     plaidConfigured: Boolean(
       process.env.PLAID_CLIENT_ID?.trim() && process.env.PLAID_SECRET?.trim()
     ),
