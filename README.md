@@ -18,7 +18,6 @@ A full-stack personal spending tracker that emulates the **Pikmin 3** end-of-day
 
 ```bash
 npm install
-npm --prefix client install
 npm run dev
 ```
 
