@@ -94,9 +94,37 @@ export function isRealPlaidConfigured(): boolean {
   return Boolean(process.env.PLAID_CLIENT_ID?.trim() && process.env.PLAID_SECRET?.trim());
 }
 
-function getPlaidClient(): PlaidApi | null {
+function extractPlaidErrorMessage(err: unknown): {
+  code?: string;
+  message: string;
+} {
+  const axiosData = (
+    err as {
+      response?: {
+        data?: {
+          error_code?: string;
+          error_message?: string;
+          display_message?: string;
+        };
+      };
+    }
+  )?.response?.data;
+
+  if (axiosData?.error_message || axiosData?.display_message) {
+    return {
+      code: axiosData.error_code,
+      message: `${axiosData.error_code ? `[${axiosData.error_code}] ` : ''}${
+        axiosData.display_message || axiosData.error_message
+      }`,
+    };
+  }
+  return {
+    message: err instanceof Error ? err.message : 'Plaid API request failed',
+  };
+}
+
+function buildPlaidClientForEnv(envName: 'sandbox' | 'development' | 'production'): PlaidApi | null {
   if (!isRealPlaidConfigured()) return null;
-  const envName = (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase();
   const basePath =
     envName === 'production'
       ? PlaidEnvironments.production
@@ -116,6 +144,58 @@ function getPlaidClient(): PlaidApi | null {
   return new PlaidApi(config);
 }
 
+let detectedWorkingEnv: 'sandbox' | 'development' | 'production' | null = null;
+
+function getEffectivePlaidEnv(): 'sandbox' | 'development' | 'production' {
+  if (detectedWorkingEnv) return detectedWorkingEnv;
+  const raw = (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase();
+  if (raw === 'production' || raw === 'development') return raw;
+  return 'sandbox';
+}
+
+function getPlaidClient(): PlaidApi | null {
+  if (!isRealPlaidConfigured()) return null;
+  return buildPlaidClientForEnv(getEffectivePlaidEnv());
+}
+
+let cachedDiag: { ok: boolean; env: string; errorCode?: string; hint?: string; checkedAt: number } | null = null;
+
+export async function diagnosePlaidSetup(): Promise<{
+  ok: boolean;
+  env: string;
+  errorCode?: string;
+  hint?: string;
+}> {
+  if (!isRealPlaidConfigured()) {
+    return { ok: true, env: 'local_sandbox' };
+  }
+  if (cachedDiag && Date.now() - cachedDiag.checkedAt < 60_000) {
+    const { checkedAt: _c, ...rest } = cachedDiag;
+    return rest;
+  }
+  try {
+    const res = await createPlaidLinkToken('https://koppad-spend.vercel.app');
+    cachedDiag = { ok: true, env: res.plaidEnv, checkedAt: Date.now() };
+    return { ok: true, env: res.plaidEnv };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Plaid check failed';
+    const codeMatch = msg.match(/\[([A-Z0-9_]+)\]/);
+    cachedDiag = {
+      ok: false,
+      env: getEffectivePlaidEnv(),
+      errorCode: codeMatch?.[1],
+      hint: msg,
+      checkedAt: Date.now(),
+    };
+    return {
+      ok: false,
+      env: getEffectivePlaidEnv(),
+      errorCode: codeMatch?.[1],
+      hint: msg,
+    };
+  }
+}
+
 export async function getPlaidStatus() {
   const realConfigured = isRealPlaidConfigured();
   const recentLogs = await db.all(
@@ -124,7 +204,7 @@ export async function getPlaidStatus() {
 
   return {
     mode: realConfigured ? 'plaid_live' : 'local_sandbox',
-    plaidEnv: (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase(),
+    plaidEnv: getEffectivePlaidEnv(),
     realConfigured,
     dbBackend: db.backend,
     mockPresets: MOCK_BANK_PRESETS,
@@ -137,13 +217,12 @@ export async function createPlaidLinkToken(originUrl?: string): Promise<{
   mode: 'plaid_live' | 'local_sandbox';
   plaidEnv: string;
 }> {
-  const plaidEnv = (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase();
-  const client = getPlaidClient();
-  if (!client) {
+  const primaryEnv = getEffectivePlaidEnv();
+  if (!isRealPlaidConfigured()) {
     return {
       linkToken: `mock-link-sandbox-${crypto.randomUUID()}`,
       mode: 'local_sandbox',
-      plaidEnv,
+      plaidEnv: primaryEnv,
     };
   }
 
@@ -152,21 +231,65 @@ export async function createPlaidLinkToken(originUrl?: string): Promise<{
     (originUrl && originUrl.startsWith('https://') ? `${originUrl}/api/plaid/webhook` : undefined);
   const redirectUri = process.env.PLAID_REDIRECT_URI?.trim() || undefined;
 
-  const response = await client.linkTokenCreate({
-    user: { client_user_id: 'koppad-captain-local' },
-    client_name: 'KopPad Ledger',
-    products: [Products.Transactions],
-    country_codes: [CountryCode.Us],
-    language: 'en',
-    ...(webhookUrl ? { webhook: webhookUrl } : {}),
-    ...(redirectUri ? { redirect_uri: redirectUri } : {}),
-  });
-
-  return {
-    linkToken: response.data.link_token,
-    mode: 'plaid_live',
-    plaidEnv,
+  const tryCreate = async (
+    envToTry: 'sandbox' | 'development' | 'production',
+    withRedirect: boolean
+  ) => {
+    const client = buildPlaidClientForEnv(envToTry)!;
+    const response = await client.linkTokenCreate({
+      user: { client_user_id: 'koppad-captain-local' },
+      client_name: 'KopPad Ledger',
+      products: [Products.Transactions],
+      country_codes: [CountryCode.Us],
+      language: 'en',
+      ...(webhookUrl ? { webhook: webhookUrl } : {}),
+      ...(withRedirect && redirectUri ? { redirect_uri: redirectUri } : {}),
+    });
+    detectedWorkingEnv = envToTry;
+    return {
+      linkToken: response.data.link_token,
+      mode: 'plaid_live' as const,
+      plaidEnv: envToTry,
+    };
   };
+
+  try {
+    return await tryCreate(primaryEnv, Boolean(redirectUri));
+  } catch (firstErr) {
+    const parsed = extractPlaidErrorMessage(firstErr);
+
+    // 1. If redirect_uri isn't registered in Plaid Dashboard yet, retry cleanly without redirect_uri
+    if (
+      redirectUri &&
+      (parsed.code === 'INVALID_FIELD' || parsed.message.toLowerCase().includes('redirect_uri'))
+    ) {
+      try {
+        return await tryCreate(primaryEnv, false);
+      } catch (retryErr) {
+        const retryParsed = extractPlaidErrorMessage(retryErr);
+        parsed.code = retryParsed.code;
+        parsed.message = retryParsed.message;
+      }
+    }
+
+    // 2. If user pasted a Production PLAID_SECRET while PLAID_ENV is still 'sandbox' (or vice-versa),
+    // automatically try the opposite environment so it works without getting stuck on INVALID_API_KEYS!
+    if (parsed.code === 'INVALID_API_KEYS') {
+      const fallbackEnv = primaryEnv === 'production' ? 'sandbox' : 'production';
+      try {
+        return await tryCreate(fallbackEnv, Boolean(redirectUri));
+      } catch {
+        try {
+          return await tryCreate(fallbackEnv, false);
+        } catch {
+          // Fall through to report detailed Plaid error
+        }
+      }
+    }
+
+    await logSync('plaid', 'error', 0, 0, `Plaid Link token error: ${parsed.message}`);
+    throw new Error(`Plaid API Error: ${parsed.message}`);
+  }
 }
 
 function formatLocalDate(date: Date): string {

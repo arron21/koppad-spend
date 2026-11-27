@@ -24,6 +24,7 @@ import type { PikminCategory } from './categorizer.ts';
 import { importCsv, previewCsv } from './csvImporter.ts';
 import {
   createPlaidLinkToken,
+  diagnosePlaidSetup,
   exchangeRealPlaidPublicToken,
   getPlaidStatus,
   linkMockAccount,
@@ -188,16 +189,18 @@ function generateCaptainDebrief(params: {
 // ======================================================
 // PUBLIC ROUTES (Health, Auth, Cron, Plaid Webhook)
 // ======================================================
-app.get('/api/health', (_req, res) => {
+app.get('/api/health', async (req, res) => {
+  const diag = req.query.diag === '1' ? await diagnosePlaidSetup() : undefined;
   res.json({
     ok: true,
     today: getTodayIso(),
     authEnabled: isAuthEnabled(),
     dbBackend: db.backend,
-    plaidEnv: (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase(),
+    plaidEnv: diag?.env || (process.env.PLAID_ENV || 'sandbox').trim().toLowerCase(),
     plaidConfigured: Boolean(
       process.env.PLAID_CLIENT_ID?.trim() && process.env.PLAID_SECRET?.trim()
     ),
+    ...(diag ? { plaidCheck: diag } : {}),
   });
 });
 
