@@ -11,5 +11,5 @@
     "resolveJsonModule": true,
     "rewriteRelativeImportExtensions": true
   },
-  "include": ["server/**/*.ts", "api/**/*.ts"]
+  "include": ["server/**/*.ts"]
 }
